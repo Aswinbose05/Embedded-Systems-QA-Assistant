@@ -94,7 +94,8 @@ def ingest_all_documents(
     print("\n--- Starting overall document ingestion process ---")
 
     # 1. Load YouTube content
-    youtube_docs = load_youtube_content(youtube_url, youtube_save_dir)
+    ##youtube_docs = load_youtube_content(youtube_url, youtube_save_dir)
+    youtube_docs = []
 
     # 2. Load PDF content
     pdf_docs = load_pdf_content(pdf_directory)

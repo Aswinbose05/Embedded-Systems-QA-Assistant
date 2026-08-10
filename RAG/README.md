@@ -26,7 +26,7 @@ In this project I have used `uv` to install, please feel free to use any package
 
 #### Activate the environment
 
-`source .venv/bin/activate`
+`source .venv/Scripts/activate`
 
 #### Install Dependencies
 

@@ -1,0 +1,3 @@
+PS D:\Projects\RAG\Embedded Systems QA Assistant\rag> cd "D:\Projects\RAG\Embedded Systems QA Assistant\RAG"
+PS D:\Projects\RAG\Embedded Systems QA Assistant\RAG> .\.venv\Scripts\Activate.ps1
+(.venv) PS D:\Projects\RAG\Embedded Systems QA Assistant\RAG> python -m streamlit run app.py

@@ -1,0 +1,11 @@
+question,reference_answer
+What is a class?,A class is a model or template used to create objects.
+What is an object?,An object is an instance of a class that holds data and can perform actions.
+What is encapsulation?,Encapsulation means protecting data by keeping it private inside a class and allowing access through methods.
+What is inheritance?,Inheritance allows one class to use the properties and methods of another class.
+What is polymorphism?,Polymorphism means one thing behaving in many ways.
+What are the two types of polymorphism?,The two types are compile-time polymorphism through overloading and run-time polymorphism through overriding.
+What is abstraction?,Abstraction means hiding internal details and showing only necessary information.
+How is abstraction implemented in Java?,Abstraction is implemented using abstract classes and interfaces.
+What keyword is used for inheritance in Java?,The extends keyword is used for inheritance.
+What is method overriding?,Method overriding occurs when a child class provides a different implementation of a method from its parent class.
