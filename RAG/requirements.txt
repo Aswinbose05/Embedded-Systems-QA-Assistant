@@ -5,12 +5,12 @@ langchain
 langchain-core
 langchain-community
 langchain-text-splitters
-langchain-huggingface
 langchain-groq
 langchain-chroma
-langgraph
+langchain-huggingface
 
 chromadb
 sentence-transformers
 pypdf
 docx2txt
+pandas

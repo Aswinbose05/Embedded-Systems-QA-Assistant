@@ -1,618 +1,759 @@
 import os
-import shutil
-import tempfile
-from pathlib import Path
-
+import hashlib
 import streamlit as st
+
 from dotenv import load_dotenv
 
-from langchain_groq import ChatGroq
-from langchain_chroma import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader
+
+from langchain_community.document_loaders import (
+    PyPDFLoader,
+    Docx2txtLoader,
+    TextLoader,
+    CSVLoader,
+)
+
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
+from langchain_groq import ChatGroq
 
 
-# ============================================================
-# CONFIG
-# ============================================================
+# =========================================================
+# ENVIRONMENT
+# =========================================================
 
 load_dotenv()
 
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+if not GROQ_API_KEY:
+    try:
+        GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+    except Exception:
+        GROQ_API_KEY = None
+
+if not GROQ_API_KEY:
+    st.error("❌ GROQ_API_KEY is not configured.")
+    st.stop()
+
+os.environ["GROQ_API_KEY"] = GROQ_API_KEY
+
+
+# =========================================================
+# CONFIGURATION
+# =========================================================
+
+CHROMA_DIRECTORY = "./chroma_db"
+
+COLLECTION_NAME = "academic_qa"
+
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+CHUNK_SIZE = 700
+CHUNK_OVERLAP = 100
+
+TOP_K = 5
+
+
+# =========================================================
+# PAGE
+# =========================================================
+
 st.set_page_config(
-    page_title="Embedded Systems QA Assistant",
+    page_title="Academic QA",
     page_icon="🤖",
     layout="wide",
 )
 
-st.title("🤖 Embedded Systems QA Assistant")
-st.caption("Upload your document and ask questions using RAG + Groq")
 
-
-# ============================================================
-# GROQ API KEY
-# ============================================================
-
-groq_api_key = os.getenv("GROQ_API_KEY")
-
-# Streamlit Cloud Secrets fallback
-if not groq_api_key:
-    try:
-        groq_api_key = st.secrets["GROQ_API_KEY"]
-    except Exception:
-        groq_api_key = None
-
-if not groq_api_key:
-    st.error(
-        "GROQ_API_KEY is missing. "
-        "Add it to your .env file locally or Streamlit Secrets when deployed."
-    )
-    st.stop()
-
-
-# ============================================================
-# SETTINGS
-# ============================================================
-
-CHROMA_DIR = "./chroma_db"
-COLLECTION_NAME = "embedded_systems_qa"
-
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-
-CHUNK_SIZE = 800
-CHUNK_OVERLAP = 150
-
-TOP_K = 4
-
-
-# ============================================================
-# LOAD EMBEDDINGS
-# ============================================================
+# =========================================================
+# EMBEDDINGS
+# =========================================================
 
 @st.cache_resource
-def load_embeddings():
+def get_embeddings():
 
     return HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL
     )
 
 
-embeddings = load_embeddings()
+embeddings = get_embeddings()
 
 
-# ============================================================
-# LOAD GROQ MODEL
-# ============================================================
+# =========================================================
+# CHROMA
+# =========================================================
 
 @st.cache_resource
-def load_llm():
+def get_vector_store():
+
+    return Chroma(
+        collection_name=COLLECTION_NAME,
+        persist_directory=CHROMA_DIRECTORY,
+        embedding_function=embeddings,
+    )
+
+
+vectordb = get_vector_store()
+
+
+# =========================================================
+# GROQ
+# =========================================================
+
+@st.cache_resource
+def get_llm():
 
     return ChatGroq(
-        api_key=groq_api_key,
         model="llama-3.1-8b-instant",
-        temperature=0.0,
+        temperature=0,
         max_tokens=500,
     )
 
 
-llm = load_llm()
+llm = get_llm()
 
 
-# ============================================================
+# =========================================================
+# FILE HASH
+# =========================================================
+
+def get_file_hash(uploaded_file):
+
+    return hashlib.md5(
+        uploaded_file.getvalue()
+    ).hexdigest()
+
+
+# =========================================================
 # LOAD DOCUMENT
-# ============================================================
+# =========================================================
 
-def load_document(file_path, file_name):
+def load_document(uploaded_file):
 
-    extension = Path(file_name).suffix.lower()
+    extension = uploaded_file.name.lower().split(".")[-1]
 
-    if extension == ".pdf":
+    temp_directory = "./uploaded_documents"
+
+    os.makedirs(
+        temp_directory,
+        exist_ok=True
+    )
+
+    file_path = os.path.join(
+        temp_directory,
+        uploaded_file.name
+    )
+
+    with open(file_path, "wb") as file:
+
+        file.write(
+            uploaded_file.getbuffer()
+        )
+
+
+    if extension == "pdf":
+
         loader = PyPDFLoader(file_path)
 
-    elif extension == ".txt":
+    elif extension == "docx":
+
+        loader = Docx2txtLoader(file_path)
+
+    elif extension == "txt":
+
         loader = TextLoader(
             file_path,
             encoding="utf-8"
         )
 
-    elif extension == ".docx":
-        loader = Docx2txtLoader(file_path)
+    elif extension == "csv":
+
+        loader = CSVLoader(file_path)
 
     else:
+
         raise ValueError(
-            "Unsupported file type. Please upload PDF, TXT or DOCX."
+            f"Unsupported file type: {extension}"
         )
 
-    return loader.load()
+
+    documents = loader.load()
 
 
-# ============================================================
-# SPLIT DOCUMENT
-# ============================================================
+    # Add source information
 
-def split_documents(documents):
+    for document in documents:
+
+        document.metadata["source"] = uploaded_file.name
+
+
+    return documents
+
+
+# =========================================================
+# PROCESS DOCUMENT
+# =========================================================
+
+def process_document(uploaded_file):
+
+    documents = load_document(
+        uploaded_file
+    )
+
+
+    # Split
 
     splitter = RecursiveCharacterTextSplitter(
+
         chunk_size=CHUNK_SIZE,
+
         chunk_overlap=CHUNK_OVERLAP,
+
         separators=[
             "\n\n",
             "\n",
             ". ",
             " ",
-            ""
+            "",
         ],
     )
 
-    return splitter.split_documents(documents)
 
-
-# ============================================================
-# CREATE CHROMA VECTOR DATABASE
-# ============================================================
-
-def create_vectorstore(chunks):
-
-    # Remove old database
-    if os.path.exists(CHROMA_DIR):
-        shutil.rmtree(CHROMA_DIR)
-
-    vectorstore = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        collection_name=COLLECTION_NAME,
-        persist_directory=CHROMA_DIR,
+    chunks = splitter.split_documents(
+        documents
     )
 
-    return vectorstore
+
+    document_id = get_file_hash(
+        uploaded_file
+    )
 
 
-# ============================================================
-# PROCESS UPLOADED DOCUMENT
-# ============================================================
+    # Add metadata
 
-def process_document(uploaded_file):
+    for index, chunk in enumerate(chunks):
 
-    suffix = Path(uploaded_file.name).suffix
+        chunk.metadata["document_id"] = document_id
 
-    with tempfile.NamedTemporaryFile(
-        delete=False,
-        suffix=suffix
-    ) as temp_file:
+        chunk.metadata["chunk_id"] = index
 
-        temp_file.write(uploaded_file.getvalue())
-        temp_path = temp_file.name
 
-    try:
+    # Unique IDs for Chroma
 
-        documents = load_document(
-            temp_path,
-            uploaded_file.name
+    ids = []
+
+    for index in range(len(chunks)):
+
+        ids.append(
+            f"{document_id}_{index}"
         )
 
-        if not documents:
-            raise ValueError(
-                "No text could be extracted from this document."
-            )
 
-        chunks = split_documents(documents)
+    # Add documents
 
-        if not chunks:
-            raise ValueError(
-                "Document was loaded but no chunks were created."
-            )
-
-        vectorstore = create_vectorstore(chunks)
-
-        return vectorstore, documents, chunks
-
-    finally:
-
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+    vectordb.add_documents(
+        documents=chunks,
+        ids=ids,
+    )
 
 
-# ============================================================
+    return len(chunks)
+
+
+# =========================================================
 # GENERATE ANSWER
-# ============================================================
+# =========================================================
 
-def generate_answer(question, retrieved_docs):
-
-    if not retrieved_docs:
-
-        return (
-            "I don't know based on the uploaded documents."
-        )
+def generate_answer(
+    question,
+    documents
+):
 
     context_parts = []
 
-    for i, (doc, score) in enumerate(retrieved_docs, start=1):
 
-        source = doc.metadata.get(
+    for index, document in enumerate(documents):
+
+        source = document.metadata.get(
             "source",
             "Unknown"
         )
 
-        page = doc.metadata.get(
+        page = document.metadata.get(
             "page",
             None
         )
 
+
         if page is not None:
-            page = page + 1
+
+            page_number = int(page) + 1
+
+        else:
+
+            page_number = "N/A"
+
 
         context_parts.append(
             f"""
-DOCUMENT CHUNK {i}
+DOCUMENT {index + 1}
+
 Source: {source}
-Page: {page if page else "N/A"}
+
+Page: {page_number}
 
 Content:
-{doc.page_content}
+{document.page_content}
 """
         )
 
-    context = "\n\n".join(context_parts)
+
+    context = "\n\n".join(
+        context_parts
+    )
+
 
     prompt = f"""
-You are an AI assistant for question answering over uploaded documents.
+You are an intelligent document question-answering assistant.
 
-Use ONLY the information provided in the document context.
+Your job is to answer the user's question using the provided document context.
+
+IMPORTANT RULES:
+
+1. Read the entire provided context carefully.
+2. Answer using information from the context.
+3. If the answer is clearly present, explain it naturally.
+4. You may combine information from multiple retrieved chunks.
+5. Do not say "I don't know" if the answer can reasonably be found in the context.
+6. Do not use outside knowledge.
+7. If the answer genuinely does not exist in the context, say:
+   "I couldn't find the answer in the uploaded documents."
+8. Give a clear and useful answer.
+9. Use simple language.
+10. If appropriate, use bullet points or examples.
 
 DOCUMENT CONTEXT:
+=================
+
 {context}
 
+=================
+
 USER QUESTION:
+
 {question}
-
-Instructions:
-
-1. Answer the question using the document context.
-2. Give a clear and useful answer.
-3. Do not simply copy the entire document.
-4. If the context contains the answer, explain it naturally.
-5. If the answer is not present in the context, say:
-   "I don't know based on the uploaded documents."
-6. Do not invent information.
 
 ANSWER:
 """
 
-    response = llm.invoke(prompt)
+
+    response = llm.invoke(
+        prompt
+    )
+
 
     return response.content
 
 
-# ============================================================
+# =========================================================
+# SESSION STATE
+# =========================================================
+
+if "messages" not in st.session_state:
+
+    st.session_state.messages = []
+
+
+if "processed_files" not in st.session_state:
+
+    st.session_state.processed_files = set()
+
+
+# =========================================================
+# HEADER
+# =========================================================
+
+st.title(
+    "🤖 Academic QA"
+)
+
+st.caption(
+    "Upload your documents and ask questions using RAG."
+)
+
+
+# =========================================================
 # SIDEBAR
-# ============================================================
+# =========================================================
 
 with st.sidebar:
 
-    st.header("📄 Document Upload")
-
-    uploaded_file = st.file_uploader(
-        "Upload a document",
-        type=["pdf", "txt", "docx"],
+    st.header(
+        "📚 Knowledge Base"
     )
 
+
+    uploaded_files = st.file_uploader(
+
+        "Upload documents",
+
+        type=[
+            "pdf",
+            "docx",
+            "txt",
+            "csv",
+        ],
+
+        accept_multiple_files=True,
+    )
+
+
     process_button = st.button(
-        "⚙️ Process Document",
+
+        "🚀 Process Documents",
+
         use_container_width=True,
     )
 
-    st.divider()
 
-    st.subheader("⚙️ RAG Settings")
+    # =====================================================
+    # PROCESS BUTTON
+    # =====================================================
 
-    st.write(
-        f"**Embedding:** `{EMBEDDING_MODEL}`"
-    )
+    if process_button:
 
-    st.write(
-        f"**Chunk Size:** `{CHUNK_SIZE}`"
-    )
+        if not uploaded_files:
 
-    st.write(
-        f"**Top K:** `{TOP_K}`"
-    )
+            st.warning(
+                "Please upload at least one document."
+            )
 
-    st.write(
-        "**LLM:** `llama-3.1-8b-instant`"
-    )
+        else:
+
+            progress = st.progress(0)
+
+            processed_count = 0
 
 
-# ============================================================
-# PROCESS DOCUMENT BUTTON
-# ============================================================
+            for index, uploaded_file in enumerate(
+                uploaded_files
+            ):
 
-if process_button:
-
-    if uploaded_file is None:
-
-        st.warning(
-            "Please upload a document first."
-        )
-
-    else:
-
-        with st.spinner(
-            "Processing document..."
-        ):
-
-            try:
-
-                vectorstore, documents, chunks = (
-                    process_document(uploaded_file)
+                file_hash = get_file_hash(
+                    uploaded_file
                 )
 
-                st.session_state.vectorstore = vectorstore
-                st.session_state.document_name = uploaded_file.name
-                st.session_state.chunk_count = len(chunks)
 
-                st.session_state.chat_history = []
+                # Avoid duplicate processing
+
+                if file_hash in st.session_state.processed_files:
+
+                    st.info(
+                        f"Already processed: "
+                        f"{uploaded_file.name}"
+                    )
+
+                    continue
+
+
+                try:
+
+                    with st.spinner(
+                        f"Processing {uploaded_file.name}..."
+                    ):
+
+                        chunks_count = process_document(
+                            uploaded_file
+                        )
+
+
+                    st.session_state.processed_files.add(
+                        file_hash
+                    )
+
+
+                    processed_count += 1
+
+
+                    st.success(
+                        f"✅ {uploaded_file.name} "
+                        f"processed successfully "
+                        f"({chunks_count} chunks)"
+                    )
+
+
+                except Exception as error:
+
+                    st.error(
+                        f"❌ Error processing "
+                        f"{uploaded_file.name}: "
+                        f"{error}"
+                    )
+
+
+                progress.progress(
+                    (index + 1) / len(uploaded_files)
+                )
+
+
+            if processed_count > 0:
 
                 st.success(
-                    f"✅ {uploaded_file.name} processed successfully!"
-                )
-
-                st.info(
-                    f"📄 Pages/Documents: {len(documents)}  |  "
-                    f"🧩 Chunks: {len(chunks)}"
-                )
-
-            except Exception as e:
-
-                st.error(
-                    f"❌ Error processing document: {e}"
+                    "🎉 Documents added to the knowledge base!"
                 )
 
 
-# ============================================================
-# DOCUMENT STATUS
-# ============================================================
+    # =====================================================
+    # KNOWLEDGE BASE INFO
+    # =====================================================
 
-if "vectorstore" in st.session_state:
+    st.divider()
 
-    st.success(
-        f"📚 Active document: "
-        f"**{st.session_state.document_name}**"
-    )
-
-    st.caption(
-        f"Created {st.session_state.chunk_count} chunks"
+    st.subheader(
+        "🔎 Knowledge Base"
     )
 
 
-# ============================================================
+    try:
+
+        collection_data = vectordb.get()
+
+        total_chunks = len(
+            collection_data["ids"]
+        )
+
+    except Exception:
+
+        total_chunks = 0
+
+
+    st.metric(
+        "Stored Chunks",
+        total_chunks
+    )
+
+
+# =========================================================
 # CHAT HISTORY
-# ============================================================
+# =========================================================
 
-if "chat_history" not in st.session_state:
+for message in st.session_state.messages:
 
-    st.session_state.chat_history = []
+    with st.chat_message(
+        message["role"]
+    ):
+
+        st.markdown(
+            message["content"]
+        )
 
 
-for message in st.session_state.chat_history:
-
-    with st.chat_message(message["role"]):
-
-        st.markdown(message["content"])
-
-
-# ============================================================
+# =========================================================
 # CHAT INPUT
-# ============================================================
+# =========================================================
 
 question = st.chat_input(
-    "Ask a question about your uploaded document..."
+    "Ask a question about your documents..."
 )
 
 
 if question:
 
-    # --------------------------------------------
-    # Check document
-    # --------------------------------------------
+    # =====================================================
+    # USER
+    # =====================================================
 
-    if "vectorstore" not in st.session_state:
-
-        st.warning(
-            "Please upload and process a document first."
-        )
-
-        st.stop()
-
-
-    # --------------------------------------------
-    # Display question
-    # --------------------------------------------
-
-    st.session_state.chat_history.append(
+    st.session_state.messages.append(
         {
             "role": "user",
-            "content": question
+            "content": question,
         }
     )
+
 
     with st.chat_message("user"):
 
         st.markdown(question)
 
 
-    # --------------------------------------------
-    # Retrieve + Generate
-    # --------------------------------------------
+    # =====================================================
+    # ASSISTANT
+    # =====================================================
 
     with st.chat_message("assistant"):
 
-        with st.spinner(
-            "🔎 Retrieving information and generating answer..."
-        ):
+        try:
 
-            try:
+            with st.spinner(
+                "🔎 Searching documents..."
+            ):
 
-                vectorstore = (
-                    st.session_state.vectorstore
-                )
+                # Retrieve documents
 
-                # Retrieve relevant chunks
-                retrieved_docs = (
-                    vectorstore.similarity_search_with_score(
-                        question,
-                        k=TOP_K
-                    )
-                )
+                results = vectordb.similarity_search_with_score(
 
-                # --------------------------------------------
-                # DEBUG: SHOW RETRIEVED DOCUMENTS
-                # --------------------------------------------
-
-                with st.expander(
-                    "🔎 Retrieved document chunks"
-                ):
-
-                    if not retrieved_docs:
-
-                        st.warning(
-                            "No relevant chunks were retrieved."
-                        )
-
-                    else:
-
-                        for i, (doc, score) in enumerate(
-                            retrieved_docs,
-                            start=1
-                        ):
-
-                            source = doc.metadata.get(
-                                "source",
-                                "Unknown"
-                            )
-
-                            page = doc.metadata.get(
-                                "page",
-                                None
-                            )
-
-                            if page is not None:
-                                page = page + 1
-
-                            st.markdown(
-                                f"### Chunk {i}"
-                            )
-
-                            st.write(
-                                f"**Source:** {source}"
-                            )
-
-                            st.write(
-                                f"**Page:** "
-                                f"{page if page else 'N/A'}"
-                            )
-
-                            st.write(
-                                f"**Similarity score:** "
-                                f"{score:.4f}"
-                            )
-
-                            st.write(
-                                doc.page_content
-                            )
-
-                            st.divider()
-
-
-                # --------------------------------------------
-                # GENERATE ANSWER WITH GROQ
-                # --------------------------------------------
-
-                answer = generate_answer(
                     question,
-                    retrieved_docs
+
+                    k=TOP_K,
                 )
 
 
-                # --------------------------------------------
-                # DISPLAY ANSWER
-                # --------------------------------------------
+            if not results:
 
-                st.markdown("### 🤖 Answer")
+                answer = (
+                    "I couldn't find any relevant "
+                    "information in the uploaded documents."
+                )
 
                 st.markdown(answer)
 
-
-                # --------------------------------------------
-                # SOURCE INFORMATION
-                # --------------------------------------------
-
-                if retrieved_docs:
-
-                    sources = []
-
-                    for doc, score in retrieved_docs:
-
-                        source = doc.metadata.get(
-                            "source",
-                            "Unknown"
-                        )
-
-                        page = doc.metadata.get(
-                            "page",
-                            None
-                        )
-
-                        if page is not None:
-                            page = page + 1
-
-                        source_info = (
-                            f"{Path(source).name}"
-                        )
-
-                        if page:
-                            source_info += (
-                                f" — Page {page}"
-                            )
-
-                        if source_info not in sources:
-                            sources.append(
-                                source_info
-                            )
-
-                    with st.expander(
-                        "📚 Sources"
-                    ):
-
-                        for source in sources:
-
-                            st.write(
-                                f"- {source}"
-                            )
-
-
-                # --------------------------------------------
-                # SAVE ANSWER
-                # --------------------------------------------
-
-                st.session_state.chat_history.append(
+                st.session_state.messages.append(
                     {
                         "role": "assistant",
-                        "content": answer
+                        "content": answer,
                     }
                 )
 
+                st.stop()
 
-            except Exception as e:
 
-                error_message = (
-                    f"❌ Error generating answer: {e}"
+            # =================================================
+            # GET DOCUMENTS
+            # =================================================
+
+            documents = [
+                document
+                for document, score in results
+            ]
+
+
+            # =================================================
+            # GENERATE ANSWER
+            # =================================================
+
+            with st.spinner(
+                "🤖 Generating answer..."
+            ):
+
+                answer = generate_answer(
+                    question,
+                    documents,
                 )
 
-                st.error(error_message)
 
-                st.session_state.chat_history.append(
-                    {
-                        "role": "assistant",
-                        "content": error_message
-                    }
+            # =================================================
+            # DISPLAY ANSWER
+            # =================================================
+
+            st.markdown(
+                "### 🤖 Answer"
+            )
+
+            st.markdown(
+                answer
+            )
+
+
+            # =================================================
+            # SOURCES
+            # =================================================
+
+            st.markdown(
+                "### 📚 Sources"
+            )
+
+
+            seen_sources = set()
+
+
+            for document, score in results:
+
+                source = document.metadata.get(
+                    "source",
+                    "Unknown"
                 )
+
+                page = document.metadata.get(
+                    "page",
+                    None
+                )
+
+
+                if page is not None:
+
+                    page_number = int(page) + 1
+
+                else:
+
+                    page_number = "N/A"
+
+
+                source_key = (
+                    source,
+                    page_number,
+                )
+
+
+                if source_key in seen_sources:
+
+                    continue
+
+
+                seen_sources.add(
+                    source_key
+                )
+
+
+                st.write(
+                    f"📄 **{source}** "
+                    f"— Page {page_number}"
+                )
+
+
+            # =================================================
+            # SAVE CHAT
+            # =================================================
+
+            final_response = (
+                f"{answer}\n\n"
+                f"### 📚 Sources\n"
+            )
+
+
+            for source, page in seen_sources:
+
+                final_response += (
+                    f"- **{source}** "
+                    f"(Page {page})\n"
+                )
+
+
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": final_response,
+                }
+            )
+
+
+        except Exception as error:
+
+            error_message = (
+                f"❌ Error generating answer: "
+                f"{error}"
+            )
+
+
+            st.error(
+                error_message
+            )
+
+
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": error_message,
+                }
+            )
