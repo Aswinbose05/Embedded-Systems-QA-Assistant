@@ -1,19 +1,16 @@
-streamlit>=1.45.1
-groq>=0.26.0
-python-dotenv>=1.1.0
+streamlit
+python-dotenv
+pandas
 
-langchain>=0.3.25
-langchain-community>=0.4.1,<0.4.2
-langchain-groq>=0.3.2
-langchain-chroma>=0.2.6
-langchain-huggingface>=1.2.2
-langchain-text-splitters>=1.1.2
-langgraph>=0.4.7
+langchain
+langchain-core
+langchain-community
+langchain-text-splitters
+langchain-groq
+langchain-chroma
+langgraph
 
-chromadb>=1.0.12
-sentence-transformers>=4.1.0
-transformers>=4.52.4
-
-pypdf>=5.6.0
-pandas>=2.2.3
-protobuf>=3.20.3,<4
+chromadb
+sentence-transformers
+pypdf
+docx2txt
