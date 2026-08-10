@@ -1,11 +1,11 @@
 streamlit
 python-dotenv
-pandas
 
 langchain
 langchain-core
 langchain-community
 langchain-text-splitters
+langchain-huggingface
 langchain-groq
 langchain-chroma
 langgraph

@@ -1,650 +1,603 @@
 import os
-import hashlib
-import pandas as pd
-import streamlit as st
+import shutil
+import tempfile
+from pathlib import Path
 
+import streamlit as st
 from dotenv import load_dotenv
 
-# LangChain
-from langchain_core.documents import Document
-from langchain_core.messages import (
-    AIMessage,
-    HumanMessage,
-    SystemMessage
-)
-
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-from langchain_community.document_loaders import (
-    PyPDFLoader,
-    Docx2txtLoader,
-    TextLoader,
-    CSVLoader
-)
-
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
-
 from langchain_groq import ChatGroq
+from langchain_chroma import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader
 
-# LangGraph
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import START, MessagesState, StateGraph
 
-
-# =========================================================
-# LOAD ENVIRONMENT
-# =========================================================
+# ============================================================
+# CONFIG
+# ============================================================
 
 load_dotenv()
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+st.set_page_config(
+    page_title="Embedded Systems QA Assistant",
+    page_icon="🤖",
+    layout="wide",
+)
 
-if not GROQ_API_KEY:
+st.title("🤖 Embedded Systems QA Assistant")
+st.caption("Upload your document and ask questions using RAG + Groq")
+
+
+# ============================================================
+# GROQ API KEY
+# ============================================================
+
+groq_api_key = os.getenv("GROQ_API_KEY")
+
+# Streamlit Cloud Secrets fallback
+if not groq_api_key:
     try:
-        GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+        groq_api_key = st.secrets["GROQ_API_KEY"]
     except Exception:
-        GROQ_API_KEY = None
+        groq_api_key = None
 
-if not GROQ_API_KEY:
-    st.error("GROQ_API_KEY is not configured.")
+if not groq_api_key:
+    st.error(
+        "GROQ_API_KEY is missing. "
+        "Add it to your .env file locally or Streamlit Secrets when deployed."
+    )
     st.stop()
 
-os.environ["GROQ_API_KEY"] = GROQ_API_KEY
 
+# ============================================================
+# SETTINGS
+# ============================================================
 
-# =========================================================
-# CONFIGURATION
-# =========================================================
-
-CHROMA_DIRECTORY = "./chroma_db"
+CHROMA_DIR = "./chroma_db"
+COLLECTION_NAME = "embedded_systems_qa"
 
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 150
 
-TOP_K = 3
+TOP_K = 4
 
 
-# =========================================================
-# PAGE CONFIG
-# =========================================================
-
-st.set_page_config(
-    page_title="Academic QA",
-    page_icon="💬",
-    layout="centered"
-)
-
-
-# =========================================================
-# EMBEDDING MODEL
-# =========================================================
+# ============================================================
+# LOAD EMBEDDINGS
+# ============================================================
 
 @st.cache_resource
-def get_embeddings_model():
+def load_embeddings():
 
     return HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL
     )
 
 
-embeddings = get_embeddings_model()
+embeddings = load_embeddings()
 
 
-# =========================================================
-# CHROMA VECTOR DATABASE
-# =========================================================
-
-@st.cache_resource
-def get_vector_store():
-
-    return Chroma(
-        collection_name="academic_qa",
-        persist_directory=CHROMA_DIRECTORY,
-        embedding_function=embeddings
-    )
-
-
-vectordb = get_vector_store()
-
-
-# =========================================================
-# GROQ MODEL
-# =========================================================
+# ============================================================
+# LOAD GROQ MODEL
+# ============================================================
 
 @st.cache_resource
-def get_chat_model():
+def load_llm():
 
     return ChatGroq(
+        api_key=groq_api_key,
         model="llama-3.1-8b-instant",
-        temperature=0,
-        max_tokens=400
+        temperature=0.0,
+        max_tokens=500,
     )
 
 
-model = get_chat_model()
+llm = load_llm()
 
 
-# =========================================================
-# DOCUMENT HASH
-# =========================================================
-
-def get_file_hash(uploaded_file):
-
-    return hashlib.md5(
-        uploaded_file.getvalue()
-    ).hexdigest()
-
-
-# =========================================================
-# SAVE UPLOADED FILE
-# =========================================================
-
-def save_uploaded_file(uploaded_file):
-
-    upload_directory = "./uploaded_documents"
-
-    os.makedirs(upload_directory, exist_ok=True)
-
-    file_path = os.path.join(
-        upload_directory,
-        uploaded_file.name
-    )
-
-    with open(file_path, "wb") as f:
-
-        f.write(uploaded_file.getbuffer())
-
-    return file_path
-
-
-# =========================================================
+# ============================================================
 # LOAD DOCUMENT
-# =========================================================
+# ============================================================
 
-def load_document(file_path):
+def load_document(file_path, file_name):
 
-    extension = file_path.lower().split(".")[-1]
+    extension = Path(file_name).suffix.lower()
 
-    if extension == "pdf":
-
+    if extension == ".pdf":
         loader = PyPDFLoader(file_path)
 
-    elif extension == "docx":
-
-        loader = Docx2txtLoader(file_path)
-
-    elif extension == "txt":
-
+    elif extension == ".txt":
         loader = TextLoader(
             file_path,
             encoding="utf-8"
         )
 
-    elif extension == "csv":
-
-        loader = CSVLoader(file_path)
+    elif extension == ".docx":
+        loader = Docx2txtLoader(file_path)
 
     else:
-
         raise ValueError(
-            f"Unsupported file format: .{extension}"
+            "Unsupported file type. Please upload PDF, TXT or DOCX."
         )
 
-    documents = loader.load()
-
-    return documents
+    return loader.load()
 
 
-# =========================================================
-# PROCESS DOCUMENT
-# =========================================================
+# ============================================================
+# SPLIT DOCUMENT
+# ============================================================
+
+def split_documents(documents):
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=[
+            "\n\n",
+            "\n",
+            ". ",
+            " ",
+            ""
+        ],
+    )
+
+    return splitter.split_documents(documents)
+
+
+# ============================================================
+# CREATE CHROMA VECTOR DATABASE
+# ============================================================
+
+def create_vectorstore(chunks):
+
+    # Remove old database
+    if os.path.exists(CHROMA_DIR):
+        shutil.rmtree(CHROMA_DIR)
+
+    vectorstore = Chroma.from_documents(
+        documents=chunks,
+        embedding=embeddings,
+        collection_name=COLLECTION_NAME,
+        persist_directory=CHROMA_DIR,
+    )
+
+    return vectorstore
+
+
+# ============================================================
+# PROCESS UPLOADED DOCUMENT
+# ============================================================
 
 def process_document(uploaded_file):
 
-    # Save document
-    file_path = save_uploaded_file(uploaded_file)
+    suffix = Path(uploaded_file.name).suffix
 
-    # Load document
-    documents = load_document(file_path)
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=suffix
+    ) as temp_file:
 
-    # Add source metadata
-    for document in documents:
+        temp_file.write(uploaded_file.getvalue())
+        temp_path = temp_file.name
 
-        document.metadata["source"] = uploaded_file.name
+    try:
 
-    # Split documents
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP
-    )
-
-    chunks = splitter.split_documents(documents)
-
-    # Add unique document ID
-    for i, chunk in enumerate(chunks):
-
-        chunk.metadata["document_id"] = get_file_hash(
-            uploaded_file
+        documents = load_document(
+            temp_path,
+            uploaded_file.name
         )
 
-        chunk.metadata["chunk_id"] = i
+        if not documents:
+            raise ValueError(
+                "No text could be extracted from this document."
+            )
 
-    # Store in Chroma
-    vectordb.add_documents(chunks)
+        chunks = split_documents(documents)
 
-    return len(chunks)
+        if not chunks:
+            raise ValueError(
+                "Document was loaded but no chunks were created."
+            )
+
+        vectorstore = create_vectorstore(chunks)
+
+        return vectorstore, documents, chunks
+
+    finally:
+
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 
-# =========================================================
-# LANGGRAPH MODEL NODE
-# =========================================================
+# ============================================================
+# GENERATE ANSWER
+# ============================================================
 
-def call_model(state: MessagesState):
+def generate_answer(question, retrieved_docs):
 
-    system_prompt = """
-You are an academic question-answering assistant.
+    if not retrieved_docs:
 
-Answer the user's question using ONLY the retrieved context.
+        return (
+            "I don't know based on the uploaded documents."
+        )
 
-Rules:
-1. If the answer is available in the context, answer clearly.
-2. If the answer is not available in the context, say:
+    context_parts = []
+
+    for i, (doc, score) in enumerate(retrieved_docs, start=1):
+
+        source = doc.metadata.get(
+            "source",
+            "Unknown"
+        )
+
+        page = doc.metadata.get(
+            "page",
+            None
+        )
+
+        if page is not None:
+            page = page + 1
+
+        context_parts.append(
+            f"""
+DOCUMENT CHUNK {i}
+Source: {source}
+Page: {page if page else "N/A"}
+
+Content:
+{doc.page_content}
+"""
+        )
+
+    context = "\n\n".join(context_parts)
+
+    prompt = f"""
+You are an AI assistant for question answering over uploaded documents.
+
+Use ONLY the information provided in the document context.
+
+DOCUMENT CONTEXT:
+{context}
+
+USER QUESTION:
+{question}
+
+Instructions:
+
+1. Answer the question using the document context.
+2. Give a clear and useful answer.
+3. Do not simply copy the entire document.
+4. If the context contains the answer, explain it naturally.
+5. If the answer is not present in the context, say:
    "I don't know based on the uploaded documents."
-3. Do not invent information.
-4. Keep the answer concise.
-5. Maximum 3 sentences unless explanation is necessary.
+6. Do not invent information.
+
+ANSWER:
 """
 
-    messages = [
-        SystemMessage(content=system_prompt)
-    ] + state["messages"]
+    response = llm.invoke(prompt)
 
-    response = model.invoke(messages)
-
-    return {
-        "messages": [response]
-    }
+    return response.content
 
 
-# =========================================================
-# LANGGRAPH
-# =========================================================
-
-@st.cache_resource
-def get_langgraph_app():
-
-    workflow = StateGraph(
-        state_schema=MessagesState
-    )
-
-    workflow.add_node(
-        "model",
-        call_model
-    )
-
-    workflow.add_edge(
-        START,
-        "model"
-    )
-
-    memory = MemorySaver()
-
-    app = workflow.compile(
-        checkpointer=memory
-    )
-
-    return app
-
-
-app = get_langgraph_app()
-
-
-# =========================================================
-# SESSION STATE
-# =========================================================
-
-if "messages" not in st.session_state:
-
-    st.session_state.messages = []
-
-
-if "thread_id" not in st.session_state:
-
-    st.session_state.thread_id = "streamlit_chat_session"
-
-
-if "processed_files" not in st.session_state:
-
-    st.session_state.processed_files = set()
-
-
-# =========================================================
-# UI
-# =========================================================
-
-st.title("💬 Academic QA")
-
-st.caption(
-    "Upload your documents and ask questions using RAG."
-)
-
-
-# =========================================================
-# SIDEBAR - DOCUMENT UPLOAD
-# =========================================================
+# ============================================================
+# SIDEBAR
+# ============================================================
 
 with st.sidebar:
 
-    st.header("📚 Knowledge Base")
+    st.header("📄 Document Upload")
 
-    uploaded_files = st.file_uploader(
-        "Upload documents",
-        type=[
-            "pdf",
-            "docx",
-            "txt",
-            "csv"
-        ],
-        accept_multiple_files=True
+    uploaded_file = st.file_uploader(
+        "Upload a document",
+        type=["pdf", "txt", "docx"],
     )
 
     process_button = st.button(
-        "⚙️ Process Documents",
-        use_container_width=True
+        "⚙️ Process Document",
+        use_container_width=True,
+    )
+
+    st.divider()
+
+    st.subheader("⚙️ RAG Settings")
+
+    st.write(
+        f"**Embedding:** `{EMBEDDING_MODEL}`"
+    )
+
+    st.write(
+        f"**Chunk Size:** `{CHUNK_SIZE}`"
+    )
+
+    st.write(
+        f"**Top K:** `{TOP_K}`"
+    )
+
+    st.write(
+        "**LLM:** `llama-3.1-8b-instant`"
     )
 
 
-    if process_button:
+# ============================================================
+# PROCESS DOCUMENT BUTTON
+# ============================================================
 
-        if not uploaded_files:
+if process_button:
 
-            st.warning(
-                "Please upload at least one document."
-            )
+    if uploaded_file is None:
 
-        else:
-
-            progress = st.progress(0)
-
-            for index, uploaded_file in enumerate(
-                uploaded_files
-            ):
-
-                file_hash = get_file_hash(
-                    uploaded_file
-                )
-
-                # Avoid processing same file twice
-                if file_hash in st.session_state.processed_files:
-
-                    st.info(
-                        f"Already processed: {uploaded_file.name}"
-                    )
-
-                    continue
-
-                try:
-
-                    with st.spinner(
-                        f"Processing {uploaded_file.name}..."
-                    ):
-
-                        chunks_count = process_document(
-                            uploaded_file
-                        )
-
-                    st.session_state.processed_files.add(
-                        file_hash
-                    )
-
-                    st.success(
-                        f"✅ {uploaded_file.name} processed "
-                        f"({chunks_count} chunks)"
-                    )
-
-                except Exception as e:
-
-                    st.error(
-                        f"❌ Error processing "
-                        f"{uploaded_file.name}: {e}"
-                    )
-
-                progress.progress(
-                    (index + 1) / len(uploaded_files)
-                )
-
-
-# =========================================================
-# SHOW CHAT HISTORY
-# =========================================================
-
-for message in st.session_state.messages:
-
-    with st.chat_message(
-        message["role"]
-    ):
-
-        st.markdown(
-            message["content"]
+        st.warning(
+            "Please upload a document first."
         )
 
+    else:
 
-# =========================================================
+        with st.spinner(
+            "Processing document..."
+        ):
+
+            try:
+
+                vectorstore, documents, chunks = (
+                    process_document(uploaded_file)
+                )
+
+                st.session_state.vectorstore = vectorstore
+                st.session_state.document_name = uploaded_file.name
+                st.session_state.chunk_count = len(chunks)
+
+                st.session_state.chat_history = []
+
+                st.success(
+                    f"✅ {uploaded_file.name} processed successfully!"
+                )
+
+                st.info(
+                    f"📄 Pages/Documents: {len(documents)}  |  "
+                    f"🧩 Chunks: {len(chunks)}"
+                )
+
+            except Exception as e:
+
+                st.error(
+                    f"❌ Error processing document: {e}"
+                )
+
+
+# ============================================================
+# DOCUMENT STATUS
+# ============================================================
+
+if "vectorstore" in st.session_state:
+
+    st.success(
+        f"📚 Active document: "
+        f"**{st.session_state.document_name}**"
+    )
+
+    st.caption(
+        f"Created {st.session_state.chunk_count} chunks"
+    )
+
+
+# ============================================================
+# CHAT HISTORY
+# ============================================================
+
+if "chat_history" not in st.session_state:
+
+    st.session_state.chat_history = []
+
+
+for message in st.session_state.chat_history:
+
+    with st.chat_message(message["role"]):
+
+        st.markdown(message["content"])
+
+
+# ============================================================
 # CHAT INPUT
-# =========================================================
+# ============================================================
 
-if prompt := st.chat_input(
-    "Ask a question about your documents..."
-):
+question = st.chat_input(
+    "Ask a question about your uploaded document..."
+)
 
-    # Add user message
-    st.session_state.messages.append(
+
+if question:
+
+    # --------------------------------------------
+    # Check document
+    # --------------------------------------------
+
+    if "vectorstore" not in st.session_state:
+
+        st.warning(
+            "Please upload and process a document first."
+        )
+
+        st.stop()
+
+
+    # --------------------------------------------
+    # Display question
+    # --------------------------------------------
+
+    st.session_state.chat_history.append(
         {
             "role": "user",
-            "content": prompt
+            "content": question
         }
     )
 
     with st.chat_message("user"):
 
-        st.markdown(prompt)
+        st.markdown(question)
 
 
-    # =====================================================
-    # ASSISTANT
-    # =====================================================
+    # --------------------------------------------
+    # Retrieve + Generate
+    # --------------------------------------------
 
     with st.chat_message("assistant"):
 
-        with st.spinner("Searching documents..."):
+        with st.spinner(
+            "🔎 Retrieving information and generating answer..."
+        ):
 
             try:
 
-                # -----------------------------------------
-                # RETRIEVE DOCUMENTS
-                # -----------------------------------------
-
-                docs = vectordb.similarity_search_with_score(
-                    prompt,
-                    k=TOP_K
+                vectorstore = (
+                    st.session_state.vectorstore
                 )
 
-
-                # -----------------------------------------
-                # CHECK WHETHER DOCUMENTS EXIST
-                # -----------------------------------------
-
-                if not docs:
-
-                    answer = (
-                        "I don't know based on the "
-                        "uploaded documents."
+                # Retrieve relevant chunks
+                retrieved_docs = (
+                    vectorstore.similarity_search_with_score(
+                        question,
+                        k=TOP_K
                     )
+                )
 
-                    st.markdown(answer)
+                # --------------------------------------------
+                # DEBUG: SHOW RETRIEVED DOCUMENTS
+                # --------------------------------------------
 
-                    st.session_state.messages.append(
-                        {
-                            "role": "assistant",
-                            "content": answer
-                        }
-                    )
+                with st.expander(
+                    "🔎 Retrieved document chunks"
+                ):
 
-                    st.stop()
+                    if not retrieved_docs:
 
-
-                # -----------------------------------------
-                # CREATE CONTEXT
-                # -----------------------------------------
-
-                context_parts = []
-
-                sources = []
-
-                for doc, score in docs:
-
-                    source = doc.metadata.get(
-                        "source",
-                        "Unknown"
-                    )
-
-                    page = doc.metadata.get(
-                        "page",
-                        None
-                    )
-
-                    if page is not None:
-
-                        page_number = int(page) + 1
+                        st.warning(
+                            "No relevant chunks were retrieved."
+                        )
 
                     else:
 
-                        page_number = "N/A"
+                        for i, (doc, score) in enumerate(
+                            retrieved_docs,
+                            start=1
+                        ):
+
+                            source = doc.metadata.get(
+                                "source",
+                                "Unknown"
+                            )
+
+                            page = doc.metadata.get(
+                                "page",
+                                None
+                            )
+
+                            if page is not None:
+                                page = page + 1
+
+                            st.markdown(
+                                f"### Chunk {i}"
+                            )
+
+                            st.write(
+                                f"**Source:** {source}"
+                            )
+
+                            st.write(
+                                f"**Page:** "
+                                f"{page if page else 'N/A'}"
+                            )
+
+                            st.write(
+                                f"**Similarity score:** "
+                                f"{score:.4f}"
+                            )
+
+                            st.write(
+                                doc.page_content
+                            )
+
+                            st.divider()
 
 
-                    context_parts.append(
-                        f"""
-Source: {source}
-Page: {page_number}
+                # --------------------------------------------
+                # GENERATE ANSWER WITH GROQ
+                # --------------------------------------------
 
-Content:
-{doc.page_content}
-"""
-                    )
-
-
-                    sources.append(
-                        {
-                            "source": source,
-                            "page": page_number,
-                            "score": score
-                        }
-                    )
-
-
-                current_context = "\n\n".join(
-                    context_parts
+                answer = generate_answer(
+                    question,
+                    retrieved_docs
                 )
 
 
-                # -----------------------------------------
-                # CREATE HUMAN MESSAGE
-                # -----------------------------------------
+                # --------------------------------------------
+                # DISPLAY ANSWER
+                # --------------------------------------------
 
-                current_turn_message = HumanMessage(
-                    content=f"""
-Retrieved Context:
+                st.markdown("### 🤖 Answer")
 
-{current_context}
-
-Question:
-
-{prompt}
-"""
-                )
+                st.markdown(answer)
 
 
-                # -----------------------------------------
-                # LANGGRAPH
-                # -----------------------------------------
-
-                result = app.invoke(
-                    {
-                        "messages": [
-                            current_turn_message
-                        ]
-                    },
-                    config={
-                        "configurable": {
-                            "thread_id":
-                            st.session_state.thread_id
-                        }
-                    }
-                )
-
-
-                # -----------------------------------------
-                # GET RESPONSE
-                # -----------------------------------------
-
-                ai_response = result[
-                    "messages"
-                ][-1].content
-
-
-                # -----------------------------------------
+                # --------------------------------------------
                 # SOURCE INFORMATION
-                # -----------------------------------------
+                # --------------------------------------------
 
-                source_text = "\n\n### 📚 Sources\n"
+                if retrieved_docs:
 
-                seen_sources = set()
+                    sources = []
 
-                for source in sources:
+                    for doc, score in retrieved_docs:
 
-                    key = (
-                        source["source"],
-                        source["page"]
-                    )
+                        source = doc.metadata.get(
+                            "source",
+                            "Unknown"
+                        )
 
-                    if key in seen_sources:
+                        page = doc.metadata.get(
+                            "page",
+                            None
+                        )
 
-                        continue
+                        if page is not None:
+                            page = page + 1
 
-                    seen_sources.add(key)
+                        source_info = (
+                            f"{Path(source).name}"
+                        )
 
-                    source_text += (
-                        f"- **{source['source']}** "
-                        f"(Page {source['page']})\n"
-                    )
+                        if page:
+                            source_info += (
+                                f" — Page {page}"
+                            )
+
+                        if source_info not in sources:
+                            sources.append(
+                                source_info
+                            )
+
+                    with st.expander(
+                        "📚 Sources"
+                    ):
+
+                        for source in sources:
+
+                            st.write(
+                                f"- {source}"
+                            )
 
 
-                # -----------------------------------------
-                # FINAL RESPONSE
-                # -----------------------------------------
+                # --------------------------------------------
+                # SAVE ANSWER
+                # --------------------------------------------
 
-                final_response = (
-                    f"{ai_response}"
-                    f"{source_text}"
-                )
-
-
-                st.markdown(
-                    final_response
-                )
-
-
-                # -----------------------------------------
-                # SAVE CHAT
-                # -----------------------------------------
-
-                st.session_state.messages.append(
+                st.session_state.chat_history.append(
                     {
                         "role": "assistant",
-                        "content": final_response
+                        "content": answer
                     }
                 )
 
@@ -652,14 +605,12 @@ Question:
             except Exception as e:
 
                 error_message = (
-                    f"❌ An error occurred: {str(e)}"
+                    f"❌ Error generating answer: {e}"
                 )
 
-                st.error(
-                    error_message
-                )
+                st.error(error_message)
 
-                st.session_state.messages.append(
+                st.session_state.chat_history.append(
                     {
                         "role": "assistant",
                         "content": error_message
