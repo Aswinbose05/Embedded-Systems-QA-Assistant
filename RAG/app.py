@@ -15,17 +15,17 @@ from langchain_community.document_loaders import (
 
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
-from langchain_groq import ChatGroq
+
+from groq import Groq
 
 
 # =========================================================
 # ENVIRONMENT
 # =========================================================
 
-
 load_dotenv()
 
-# Streamlit Cloud secrets should take priority
+# Streamlit Cloud Secret has priority
 try:
     GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 except Exception:
@@ -101,17 +101,119 @@ vectordb = get_vector_store()
 # GROQ
 # =========================================================
 
-@st.cache_resource
-def get_llm():
+# Models we prefer for this application.
+# The application will check which ones are actually
+# available to the configured Groq API key.
 
-    return ChatGroq(
-        model="llama-3.1-8b-instant",
-        temperature=0,
-        max_tokens=500,
+PREFERRED_GROQ_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "openai/gpt-oss-20b",
+    "openai/gpt-oss-120b",
+]
+
+
+@st.cache_resource
+def get_groq_client():
+
+    return Groq(
+        api_key=GROQ_API_KEY
     )
 
 
-llm = get_llm()
+@st.cache_resource
+def get_groq_model():
+
+    client = get_groq_client()
+
+    try:
+
+        model_response = client.models.list()
+
+        available_models = {
+            model.id
+            for model in model_response.data
+            if getattr(model, "active", True)
+        }
+
+    except Exception as error:
+
+        st.error(
+            f"❌ Could not check Groq models: {error}"
+        )
+
+        st.stop()
+
+    # Find the first preferred model that is available
+    for model_name in PREFERRED_GROQ_MODELS:
+
+        if model_name in available_models:
+
+            return model_name
+
+    # No supported model found
+    st.error(
+        "❌ No supported Groq chat model is available "
+        "for this API key."
+    )
+
+    st.write("Models visible to this API key:")
+
+    st.write(
+        sorted(available_models)
+    )
+
+    st.stop()
+
+
+GROQ_MODEL = get_groq_model()
+
+
+# =========================================================
+# GROQ STATUS
+# =========================================================
+
+with st.sidebar:
+
+    st.success(
+        f"🤖 Groq model: {GROQ_MODEL}"
+    )
+
+
+# =========================================================
+# GENERATE WITH GROQ
+# =========================================================
+
+def generate_with_groq(prompt):
+
+    client = get_groq_client()
+
+    response = client.chat.completions.create(
+
+        model=GROQ_MODEL,
+
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are an intelligent document "
+                    "question-answering assistant. "
+                    "Answer only from the supplied "
+                    "document context."
+                ),
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+
+        temperature=0,
+
+        max_completion_tokens=500,
+    )
+
+    return response.choices[0].message.content
 
 
 # =========================================================
@@ -131,7 +233,11 @@ def get_file_hash(uploaded_file):
 
 def load_document(uploaded_file):
 
-    extension = uploaded_file.name.lower().split(".")[-1]
+    extension = (
+        uploaded_file.name
+        .lower()
+        .split(".")[-1]
+    )
 
     temp_directory = "./uploaded_documents"
 
@@ -145,21 +251,30 @@ def load_document(uploaded_file):
         uploaded_file.name
     )
 
-    with open(file_path, "wb") as file:
+    with open(
+        file_path,
+        "wb"
+    ) as file:
 
         file.write(
             uploaded_file.getbuffer()
         )
 
-
+    # PDF
     if extension == "pdf":
 
-        loader = PyPDFLoader(file_path)
+        loader = PyPDFLoader(
+            file_path
+        )
 
+    # DOCX
     elif extension == "docx":
 
-        loader = Docx2txtLoader(file_path)
+        loader = Docx2txtLoader(
+            file_path
+        )
 
+    # TXT
     elif extension == "txt":
 
         loader = TextLoader(
@@ -167,9 +282,12 @@ def load_document(uploaded_file):
             encoding="utf-8"
         )
 
+    # CSV
     elif extension == "csv":
 
-        loader = CSVLoader(file_path)
+        loader = CSVLoader(
+            file_path
+        )
 
     else:
 
@@ -177,16 +295,14 @@ def load_document(uploaded_file):
             f"Unsupported file type: {extension}"
         )
 
-
     documents = loader.load()
 
-
     # Add source information
-
     for document in documents:
 
-        document.metadata["source"] = uploaded_file.name
-
+        document.metadata["source"] = (
+            uploaded_file.name
+        )
 
     return documents
 
@@ -197,13 +313,12 @@ def load_document(uploaded_file):
 
 def process_document(uploaded_file):
 
+    # Load document
     documents = load_document(
         uploaded_file
     )
 
-
-    # Split
-
+    # Split document
     splitter = RecursiveCharacterTextSplitter(
 
         chunk_size=CHUNK_SIZE,
@@ -219,28 +334,27 @@ def process_document(uploaded_file):
         ],
     )
 
-
     chunks = splitter.split_documents(
         documents
     )
 
-
+    # Document ID
     document_id = get_file_hash(
         uploaded_file
     )
 
-
     # Add metadata
-
     for index, chunk in enumerate(chunks):
 
-        chunk.metadata["document_id"] = document_id
+        chunk.metadata["document_id"] = (
+            document_id
+        )
 
-        chunk.metadata["chunk_id"] = index
+        chunk.metadata["chunk_id"] = (
+            index
+        )
 
-
-    # Unique IDs for Chroma
-
+    # Create unique Chroma IDs
     ids = []
 
     for index in range(len(chunks)):
@@ -249,14 +363,13 @@ def process_document(uploaded_file):
             f"{document_id}_{index}"
         )
 
-
-    # Add documents
-
+    # Store in Chroma
     vectordb.add_documents(
+
         documents=chunks,
+
         ids=ids,
     )
-
 
     return len(chunks)
 
@@ -272,8 +385,10 @@ def generate_answer(
 
     context_parts = []
 
-
-    for index, document in enumerate(documents):
+    # Build context
+    for index, document in enumerate(
+        documents
+    ):
 
         source = document.metadata.get(
             "source",
@@ -285,7 +400,6 @@ def generate_answer(
             None
         )
 
-
         if page is not None:
 
             page_number = int(page) + 1
@@ -293,7 +407,6 @@ def generate_answer(
         else:
 
             page_number = "N/A"
-
 
         context_parts.append(
             f"""
@@ -308,11 +421,13 @@ Content:
 """
         )
 
-
     context = "\n\n".join(
         context_parts
     )
 
+    # =====================================================
+    # PROMPT
+    # =====================================================
 
     prompt = f"""
 You are an intelligent document question-answering assistant.
@@ -322,15 +437,27 @@ Your job is to answer the user's question using the provided document context.
 IMPORTANT RULES:
 
 1. Read the entire provided context carefully.
+
 2. Answer using information from the context.
+
 3. If the answer is clearly present, explain it naturally.
+
 4. You may combine information from multiple retrieved chunks.
-5. Do not say "I don't know" if the answer can reasonably be found in the context.
+
+5. Do not say "I don't know" if the answer can reasonably
+   be found in the context.
+
 6. Do not use outside knowledge.
-7. If the answer genuinely does not exist in the context, say:
+
+7. If the answer genuinely does not exist in the context,
+   say:
+
    "I couldn't find the answer in the uploaded documents."
+
 8. Give a clear and useful answer.
+
 9. Use simple language.
+
 10. If appropriate, use bullet points or examples.
 
 DOCUMENT CONTEXT:
@@ -347,13 +474,10 @@ USER QUESTION:
 ANSWER:
 """
 
-
-    response = llm.invoke(
+    # Generate answer using Groq
+    return generate_with_groq(
         prompt
     )
-
-
-    return response.content
 
 
 # =========================================================
@@ -393,7 +517,7 @@ with st.sidebar:
         "📚 Knowledge Base"
     )
 
-
+    # Upload
     uploaded_files = st.file_uploader(
 
         "Upload documents",
@@ -408,7 +532,7 @@ with st.sidebar:
         accept_multiple_files=True,
     )
 
-
+    # Process button
     process_button = st.button(
 
         "🚀 Process Documents",
@@ -431,10 +555,11 @@ with st.sidebar:
 
         else:
 
-            progress = st.progress(0)
+            progress = st.progress(
+                0
+            )
 
             processed_count = 0
-
 
             for index, uploaded_file in enumerate(
                 uploaded_files
@@ -444,44 +569,48 @@ with st.sidebar:
                     uploaded_file
                 )
 
-
                 # Avoid duplicate processing
-
-                if file_hash in st.session_state.processed_files:
+                if (
+                    file_hash
+                    in st.session_state.processed_files
+                ):
 
                     st.info(
                         f"Already processed: "
                         f"{uploaded_file.name}"
                     )
 
-                    continue
+                    progress.progress(
+                        (index + 1)
+                        / len(uploaded_files)
+                    )
 
+                    continue
 
                 try:
 
                     with st.spinner(
-                        f"Processing {uploaded_file.name}..."
+                        f"Processing "
+                        f"{uploaded_file.name}..."
                     ):
 
-                        chunks_count = process_document(
-                            uploaded_file
+                        chunks_count = (
+                            process_document(
+                                uploaded_file
+                            )
                         )
-
 
                     st.session_state.processed_files.add(
                         file_hash
                     )
 
-
                     processed_count += 1
-
 
                     st.success(
                         f"✅ {uploaded_file.name} "
                         f"processed successfully "
                         f"({chunks_count} chunks)"
                     )
-
 
                 except Exception as error:
 
@@ -491,16 +620,16 @@ with st.sidebar:
                         f"{error}"
                     )
 
-
                 progress.progress(
-                    (index + 1) / len(uploaded_files)
+                    (index + 1)
+                    / len(uploaded_files)
                 )
-
 
             if processed_count > 0:
 
                 st.success(
-                    "🎉 Documents added to the knowledge base!"
+                    "🎉 Documents added to "
+                    "the knowledge base!"
                 )
 
 
@@ -514,7 +643,6 @@ with st.sidebar:
         "🔎 Knowledge Base"
     )
 
-
     try:
 
         collection_data = vectordb.get()
@@ -526,7 +654,6 @@ with st.sidebar:
     except Exception:
 
         total_chunks = 0
-
 
     st.metric(
         "Stored Chunks",
@@ -558,10 +685,14 @@ question = st.chat_input(
 )
 
 
+# =========================================================
+# QUESTION
+# =========================================================
+
 if question:
 
     # =====================================================
-    # USER
+    # USER MESSAGE
     # =====================================================
 
     st.session_state.messages.append(
@@ -571,33 +702,45 @@ if question:
         }
     )
 
+    with st.chat_message(
+        "user"
+    ):
 
-    with st.chat_message("user"):
-
-        st.markdown(question)
+        st.markdown(
+            question
+        )
 
 
     # =====================================================
     # ASSISTANT
     # =====================================================
 
-    with st.chat_message("assistant"):
+    with st.chat_message(
+        "assistant"
+    ):
 
         try:
+
+            # =================================================
+            # RETRIEVE DOCUMENTS
+            # =================================================
 
             with st.spinner(
                 "🔎 Searching documents..."
             ):
 
-                # Retrieve documents
-
-                results = vectordb.similarity_search_with_score(
-
-                    question,
-
-                    k=TOP_K,
+                results = (
+                    vectordb
+                    .similarity_search_with_score(
+                        question,
+                        k=TOP_K,
+                    )
                 )
 
+
+            # =================================================
+            # NO RESULTS
+            # =================================================
 
             if not results:
 
@@ -606,7 +749,9 @@ if question:
                     "information in the uploaded documents."
                 )
 
-                st.markdown(answer)
+                st.markdown(
+                    answer
+                )
 
                 st.session_state.messages.append(
                     {
@@ -623,8 +768,11 @@ if question:
             # =================================================
 
             documents = [
+
                 document
+
                 for document, score in results
+
             ]
 
 
@@ -663,9 +811,7 @@ if question:
                 "### 📚 Sources"
             )
 
-
             seen_sources = set()
-
 
             for document, score in results:
 
@@ -679,7 +825,6 @@ if question:
                     None
                 )
 
-
                 if page is not None:
 
                     page_number = int(page) + 1
@@ -688,22 +833,18 @@ if question:
 
                     page_number = "N/A"
 
-
                 source_key = (
                     source,
                     page_number,
                 )
 
-
                 if source_key in seen_sources:
 
                     continue
 
-
                 seen_sources.add(
                     source_key
                 )
-
 
                 st.write(
                     f"📄 **{source}** "
@@ -720,14 +861,12 @@ if question:
                 f"### 📚 Sources\n"
             )
 
-
             for source, page in seen_sources:
 
                 final_response += (
                     f"- **{source}** "
                     f"(Page {page})\n"
                 )
-
 
             st.session_state.messages.append(
                 {
@@ -744,11 +883,9 @@ if question:
                 f"{error}"
             )
 
-
             st.error(
                 error_message
             )
-
 
             st.session_state.messages.append(
                 {
