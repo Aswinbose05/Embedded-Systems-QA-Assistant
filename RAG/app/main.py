@@ -27,12 +27,6 @@ async def lifespan(app: FastAPI):
     try:
         total = vector_store_manager.get_total_chunks()
         logger.info("ChromaDB connected successfully. Total chunks indexed: %d", total)
-        if total == 0:
-            logger.info("ChromaDB is empty on startup. Auto-indexing pre-stored knowledge base files...")
-            from app.services.document_service import document_service
-            document_service.process_all_uploaded_files()
-            total = vector_store_manager.get_total_chunks()
-            logger.info("Auto-indexing complete. Total chunks indexed: %d", total)
     except Exception as exc:
         logger.warning("ChromaDB initialization warning: %s", str(exc))
 

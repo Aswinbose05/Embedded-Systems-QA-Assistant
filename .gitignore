@@ -10,5 +10,8 @@ wheels/
 .venv/
 .DS_Store
 .env
-chroma_db/
-uploaded_documents/
+
+# ChromaDB & Uploaded Documents
+**/chroma_db/
+**/uploaded_documents/*
+!**/uploaded_documents/.gitkeep
