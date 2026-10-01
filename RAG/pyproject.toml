@@ -27,4 +27,7 @@ dependencies = [
     "langchain-huggingface>=1.2.2",
     "openai>=2.28.0",
     "langchain-text-splitters>=1.1.2",
+    "fastapi>=0.142.2",
+    "python-multipart>=0.0.32",
+    "torch>=2.2.0",
 ]
