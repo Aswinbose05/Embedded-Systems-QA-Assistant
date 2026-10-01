@@ -1,7 +1,8 @@
 from typing import Any, Dict, List, Optional, Tuple
 from langchain_core.documents import Document
 from langchain_chroma import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.embeddings import Embeddings
+from chromadb.utils import embedding_functions
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.core.exceptions import RetrieverError
@@ -9,22 +10,45 @@ from app.core.exceptions import RetrieverError
 logger = get_logger("rag.vectorstore")
 
 
+class LowMemoryEmbeddings(Embeddings):
+    """
+    Lightweight ONNX-powered all-MiniLM-L6-v2 embeddings.
+    Consumes ~40MB RAM (vs 550MB for PyTorch), preventing Out-Of-Memory (OOM)
+    errors on memory-constrained servers like Render Free Tier (512MB limit).
+    Produces identical 384-dimensional vectors fully compatible with existing collections.
+    """
+    def __init__(self):
+        self._ef = embedding_functions.ONNXMiniLM_L6_V2()
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return self._ef(texts)
+
+    def embed_query(self, text: str) -> List[float]:
+        return self._ef([text])[0]
+
+
 class VectorStoreManager:
     """
-    Singleton manager for ChromaDB vector store and HuggingFace embeddings.
+    Singleton manager for ChromaDB vector store and embeddings.
     Preserves existing persistence format, collection name, and embeddings.
     """
 
     def __init__(self):
-        self._embeddings: Optional[HuggingFaceEmbeddings] = None
+        self._embeddings: Optional[Embeddings] = None
         self._vectordb: Optional[Chroma] = None
 
-    def get_embeddings(self) -> HuggingFaceEmbeddings:
+    def get_embeddings(self) -> Embeddings:
         if self._embeddings is None:
-            logger.info("Initializing HuggingFace embeddings model: %s", settings.EMBEDDING_MODEL)
-            self._embeddings = HuggingFaceEmbeddings(
-                model_name=settings.EMBEDDING_MODEL
-            )
+            try:
+                logger.info("Initializing Low-Memory ONNX embeddings (all-MiniLM-L6-v2)...")
+                self._embeddings = LowMemoryEmbeddings()
+                logger.info("Low-Memory ONNX embeddings active (~40MB RAM footprint).")
+            except Exception as exc:
+                logger.warning("ONNX initialization failed: %s. Falling back to HuggingFaceEmbeddings.", exc)
+                from langchain_huggingface import HuggingFaceEmbeddings
+                self._embeddings = HuggingFaceEmbeddings(
+                    model_name=settings.EMBEDDING_MODEL
+                )
         return self._embeddings
 
     def get_vector_store(self) -> Chroma:

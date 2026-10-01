@@ -8,9 +8,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install lightweight CPU-only PyTorch to keep build fast and avoid memory spikes
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+# Upgrade pip
+RUN pip install --no-cache-dir --upgrade pip
 
 # Copy dependencies and install
 COPY requirements.txt ./
